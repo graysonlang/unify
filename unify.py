@@ -33,6 +33,7 @@ command line and handles top-level errors before delegating to it.
 import argparse
 import hashlib
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -279,7 +280,9 @@ def archive_duplicate(run: Run, path: str, size: int, file_hash: str,
         dest_path = unique_dest(dup_hash_dir, os.path.basename(path))
 
     try:
-        os.rename(path, dest_path)
+        # shutil.move (not os.rename) so duplicates can be archived across
+        # filesystems/drives; os.rename raises EXDEV across devices.
+        shutil.move(path, dest_path)
     except OSError as e:
         run.warn(f"Failed to move duplicate '{path}' to '{dest_path}': {e}")
         return
@@ -313,10 +316,12 @@ def index_canonical(run: Run, old_cache: Cache) -> None:
             # Duplicates are never added to the rebuilt cache.
             continue
 
+        # Record the unique even on a dry run so duplicate detection works in
+        # both passes; the cache is only persisted to disk on a real run.
+        run.cache.add(rel, Entry(file_hash, size, mtime))
         if run.config.dry_run:
             print("CANON UNIQUE (dry run):", path, f"(rel: {rel})")
         else:
-            run.cache.add(rel, Entry(file_hash, size, mtime))
             run.log(file_hash, path, path)
             print("CANON UNIQUE:", path)
 
@@ -348,12 +353,17 @@ def merge_other_root(run: Run, src_root: str) -> None:
         canon_full = os.path.join(config.canonical_abs, canon_rel)
 
         if config.dry_run:
+            # Register the new hash so a later identical file is previewed as a
+            # duplicate, matching what the real run would do.
+            run.cache.add(canon_rel, Entry(file_hash, size, mtime))
             print("MOVE UNIQUE (dry run):", path, "->", canon_full)
             continue
 
         try:
             os.makedirs(os.path.dirname(canon_full), exist_ok=True)
-            os.rename(path, canon_full)
+            # shutil.move (not os.rename) so unique files can be folded into the
+            # canonical tree across filesystems/drives; os.rename raises EXDEV.
+            shutil.move(path, canon_full)
         except OSError as e:
             run.warn(f"Failed to move '{path}' to '{canon_full}': {e}")
             continue
@@ -481,11 +491,20 @@ def resolve_config(args: argparse.Namespace) -> Config:
 
     valid_others: List[str] = []
     for r in args.other_roots:
-        if os.path.isdir(r):
-            valid_others.append(r)
-        else:
+        if not os.path.isdir(r):
             print(f"WARNING: Source root '{r}' is not a directory, skipping.",
                   file=sys.stderr)
+            continue
+        other_abs = os.path.abspath(r)
+        # An additional root that equals, contains, or sits inside the canonical
+        # root would cause canonical originals to be archived/deleted as their
+        # own duplicates. Reject overlapping roots outright.
+        if is_under(other_abs, canonical_abs) or is_under(canonical_abs, other_abs):
+            raise SystemExit(
+                f"ERROR: Source root '{r}' overlaps the canonical root "
+                f"'{canonical_abs}'.\n"
+                f"       Canonical and additional roots must be disjoint trees.")
+        valid_others.append(r)
 
     src_roots_abs = [canonical_abs] + [os.path.abspath(r) for r in valid_others]
     for parent in src_roots_abs:
