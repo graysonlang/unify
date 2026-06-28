@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import sys
+sys.dont_write_bytecode = True
+
 """unify.py  (dedupe_movies_unified)
 
 Use the FIRST source root as the unified, canonical tree.
@@ -34,7 +37,6 @@ import argparse
 import hashlib
 import os
 import shutil
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -46,7 +48,7 @@ HashStr = str
 CACHE_FILENAME = ".hash_map.tsv"
 DUPLICATES_DIRNAME = "Duplicates"
 LOG_FILENAME = "move_log.tsv"
-SKIP_NAMES = {".DS_Store"}
+SKIP_NAMES = {".DS_Store", CACHE_FILENAME}
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
 HASH_ALGOS = {"md5": hashlib.md5, "sha1": hashlib.sha1}
@@ -168,6 +170,13 @@ def canonical_rel_for(src_root_abs: str, path: str, file_hash: str,
         name, ext = os.path.splitext(base)
         suffixed = f"{name}_{file_hash[:8]}{ext}"
         candidate = os.path.join(rel_dir, suffixed) if rel_dir else suffixed
+        # Guard against the suffixed name colliding too (e.g. a hash-prefix
+        # clash) so the later move can't silently overwrite a different file.
+        i = 1
+        while os.path.exists(os.path.join(canonical_abs, candidate)):
+            alt = f"{name}_{file_hash[:8]}_{i}{ext}"
+            candidate = os.path.join(rel_dir, alt) if rel_dir else alt
+            i += 1
     return candidate
 
 
@@ -299,6 +308,9 @@ def index_canonical(run: Run, old_cache: Cache) -> None:
 
     for path, rel in iter_files(canonical_abs):
         size, mtime = stat_signature(path)
+        if size < 0:
+            run.warn(f"Failed to stat '{path}', skipping.")
+            continue
         file_hash = old_cache.cached_hash(rel, size, mtime)
         if file_hash is None:
             try:
@@ -338,6 +350,9 @@ def merge_other_root(run: Run, src_root: str) -> None:
 
     for path, _rel in iter_files(src_abs):
         size, mtime = stat_signature(path)
+        if size < 0:
+            run.warn(f"Failed to stat '{path}', skipping.")
+            continue
         try:
             file_hash = hash_file(path, config.hash_algo)
         except OSError as e:
