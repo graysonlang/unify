@@ -39,7 +39,7 @@ import os
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, TextIO, Tuple
 
 # Type aliases for readability.
 RelPath = str
@@ -231,6 +231,14 @@ class Run:
     config: Config
     cache: Cache = field(default_factory=Cache)
     failures: int = 0
+    # hash -> (path of the first archived copy, its size). Lets duplicates be
+    # collapsed by content regardless of filename, and lets a source be deleted
+    # only once an identically sized copy of the same hash is known to be
+    # archived this run (no trusting an unverified pre-existing file).
+    archived: Dict[HashStr, Tuple[str, int]] = field(default_factory=dict)
+    # Open move-log handle for the run (None on a dry run); kept open so the hot
+    # path never reopens the file per logged operation.
+    log_fh: Optional[TextIO] = field(default=None, repr=False)
 
     def warn(self, message: str) -> None:
         """Print a warning, count it as a failure, and let the caller continue."""
@@ -238,10 +246,9 @@ class Run:
         self.failures += 1
 
     def log(self, file_hash: str, src: str, dest: str) -> None:
-        if self.config.dry_run:
+        if self.log_fh is None:
             return
-        with open(self.config.log_file, "a", encoding="utf-8") as lf:
-            lf.write(f"{file_hash}\t{src}\t{dest}\n")
+        self.log_fh.write(f"{file_hash}\t{src}\t{dest}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -252,21 +259,36 @@ def archive_duplicate(run: Run, path: str, size: int, file_hash: str,
                       label: str) -> None:
     """Move (or delete, if already archived identically) a duplicate file.
 
-    Same hash already present in the canonical set -> the file is redundant.
-    If an identically named, identically sized copy is already under
-    Duplicates/<hash>/, the source is simply deleted; otherwise it is moved
-    there (suffixing the name on a size mismatch). Any filesystem error is
-    reported via run.warn and processing continues.
+    The file's hash is already present in the canonical set, so it is redundant.
+    The first copy of each hash seen this run is moved under Duplicates/<hash>/;
+    any later file with the same hash AND the same size is byte-identical to it
+    and is simply deleted. A same-hash/different-size file (only possible on a
+    genuine hash collision) is kept alongside under a suffixed name rather than
+    deleted. Any filesystem error is reported via run.warn and processing
+    continues.
     """
     dup_hash_dir = os.path.join(run.config.duplicates_dir, file_hash)
-    dest_path = os.path.join(dup_hash_dir, os.path.basename(path))
     tag = f"{label} DUP" if label else "DUP"
+    prior = run.archived.get(file_hash)
+    already_have = prior is not None and prior[1] == size
 
     if run.config.dry_run:
-        if os.path.exists(dest_path):
-            print(f"{tag} (dry run, would delete):", path)
+        if already_have:
+            print(f"{tag} (dry run, would delete):", path, f"(already have {prior[0]})")
         else:
-            print(f"{tag} (dry run, would move):", path, "->", dest_path)
+            dest_preview = os.path.join(dup_hash_dir, os.path.basename(path))
+            print(f"{tag} (dry run, would move):", path, "->", dest_preview)
+            run.archived.setdefault(file_hash, (dest_preview, size))
+        return
+
+    if already_have:
+        try:
+            os.remove(path)
+        except OSError as e:
+            run.warn(f"Failed to delete duplicate '{path}': {e}")
+            return
+        run.log(file_hash, path, prior[0])
+        print(f"DELETED {tag}:", path, f"(already have {prior[0]})")
         return
 
     try:
@@ -275,19 +297,7 @@ def archive_duplicate(run: Run, path: str, size: int, file_hash: str,
         run.warn(f"Failed to create duplicates dir '{dup_hash_dir}' for '{path}': {e}")
         return
 
-    if os.path.exists(dest_path):
-        if os.path.getsize(dest_path) == size:
-            try:
-                os.remove(path)
-            except OSError as e:
-                run.warn(f"Failed to delete duplicate '{path}': {e}")
-                return
-            run.log(file_hash, path, dest_path)
-            print(f"DELETED {tag}:", path, f"(already have {dest_path})")
-            return
-        # Same hash, different size: keep both under a suffixed name.
-        dest_path = unique_dest(dup_hash_dir, os.path.basename(path))
-
+    dest_path = unique_dest(dup_hash_dir, os.path.basename(path))
     try:
         # shutil.move (not os.rename) so duplicates can be archived across
         # filesystems/drives; os.rename raises EXDEV across devices.
@@ -295,6 +305,9 @@ def archive_duplicate(run: Run, path: str, size: int, file_hash: str,
     except OSError as e:
         run.warn(f"Failed to move duplicate '{path}' to '{dest_path}': {e}")
         return
+    # Remember the first archived copy per hash so later identical files collapse
+    # onto it regardless of their original filename.
+    run.archived.setdefault(file_hash, (dest_path, size))
     run.log(file_hash, path, dest_path)
     print(f"MOVED {tag}:", path, "->", dest_path)
 
@@ -320,12 +333,9 @@ def index_canonical(run: Run, old_cache: Cache) -> None:
                 continue
 
         if file_hash in run.cache.by_hash:
-            existing = os.path.join(canonical_abs, run.cache.by_hash[file_hash])
-            if run.config.dry_run:
-                print("CANON DUP (dry run):", path, f"(duplicate of {existing})")
-            else:
-                archive_duplicate(run, path, size, file_hash, label="CANON")
-            # Duplicates are never added to the rebuilt cache.
+            # Intra-canonical duplicate: archive it (dry-run aware) and never add
+            # it to the rebuilt cache.
+            archive_duplicate(run, path, size, file_hash, label="CANON")
             continue
 
         # Record the unique even on a dry run so duplicate detection works in
@@ -343,7 +353,8 @@ def merge_other_root(run: Run, src_root: str) -> None:
 
     Files whose hash is already canonical are archived as duplicates; genuinely
     new content is moved into the canonical tree (preserving its relative
-    hierarchy) and appended to both the in-memory cache and the on-disk cache."""
+    hierarchy) and added to the in-memory cache, which unify() persists once at
+    the end of the run."""
     config = run.config
     src_abs = os.path.abspath(src_root)
     print("Source root:", src_abs)
@@ -385,8 +396,6 @@ def merge_other_root(run: Run, src_root: str) -> None:
 
         new_size, new_mtime = stat_signature(canon_full)
         run.cache.add(canon_rel, Entry(file_hash, new_size, new_mtime))
-        with open(config.cache_file, "a", encoding="utf-8") as cf:
-            cf.write(f"{file_hash}\t{canon_rel}\t{new_size}\t{new_mtime}\n")
         run.log(file_hash, path, canon_full)
         print("MOVED UNIQUE:", path, "->", canon_full)
 
@@ -416,24 +425,35 @@ def unify(config: Config) -> int:
     print(f"Hash algorithm:          {config.hash_algo}")
     print(f"Dry run:                 {config.dry_run}\n")
 
-    if not config.dry_run:
-        os.makedirs(config.duplicates_dir, exist_ok=True)
-        os.makedirs(config.timestamp_abs, exist_ok=True)
-        with open(config.log_file, "w", encoding="utf-8") as lf:
-            lf.write("hash\tsrc_path\tdest_path\n")
-
     run = Run(config=config)
     old_cache = Cache.load(config.cache_file)
 
-    # Pass 1: canonical tree (rebuilds run.cache from surviving uniques).
-    index_canonical(run, old_cache)
     if not config.dry_run:
-        run.cache.write(config.cache_file)
+        os.makedirs(config.duplicates_dir, exist_ok=True)
+        os.makedirs(config.timestamp_abs, exist_ok=True)
+        # Line-buffered so each logged move is durable without reopening the file
+        # per operation.
+        run.log_fh = open(config.log_file, "w", buffering=1, encoding="utf-8")
+        run.log_fh.write("hash\tsrc_path\tdest_path\n")
 
-    # Pass 2: fold each additional root into the canonical set.
-    print("\nProcessing additional source roots...\n")
-    for src_root in config.other_roots:
-        merge_other_root(run, src_root)
+    try:
+        # Pass 1: canonical tree (rebuilds run.cache from surviving uniques).
+        index_canonical(run, old_cache)
+        if not config.dry_run:
+            run.cache.write(config.cache_file)
+
+        # Pass 2: fold each additional root into the canonical set.
+        print("\nProcessing additional source roots...\n")
+        for src_root in config.other_roots:
+            merge_other_root(run, src_root)
+
+        # Persist the cache once more so pass-2 additions are recorded (replaces
+        # the former per-file on-disk append).
+        if not config.dry_run:
+            run.cache.write(config.cache_file)
+    finally:
+        if run.log_fh is not None:
+            run.log_fh.close()
 
     print("\nDone.")
     if config.dry_run:
