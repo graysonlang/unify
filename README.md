@@ -1,8 +1,13 @@
 # unify
 
-Consolidate several directory trees of files into one **canonical** tree,
-deduplicating by content hash. Built for merging overlapping media libraries and
-backups (e.g. a few external drives full of movies) into a single clean tree.
+`unify` is a Python command-line utility for merging several directory trees of
+files into one **canonical** tree, deduplicating by content hash. It's built for
+consolidating overlapping media libraries and backups — for example, a handful of
+external drives full of movies — into a single clean tree, with every duplicate
+set aside (not silently destroyed) and a log of everything it moved.
+
+It's a single self-contained script (Python 3.8+, standard library only) with no
+dependencies to install.
 
 > ⚠️ **This program moves and deletes real files.** Always do a dry run (`-n`)
 > first and read what it intends to do.
