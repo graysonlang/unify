@@ -6,35 +6,15 @@ and known sharp edges that aren't obvious from the code alone.
 
 ## What this tool does
 
-`unify.py` consolidates multiple directory trees of media files into one
-**canonical** tree, deduplicating by content hash.
-
-- The **first** positional argument is the canonical root. It is the source of
-  truth and the destination; unique content from other roots is *moved into* it.
-- Every additional positional argument is an **other root** that gets folded in:
-  files whose content already exists in the canonical set are moved aside as
-  duplicates; genuinely new files are moved into the canonical tree, preserving
-  their relative directory structure.
-- Duplicates are relocated to `TIMESTAMP/Duplicates/<hash>/<original-filename>`.
-  The first copy of a given hash seen in a run is moved there; any later file
-  with the **same hash and the same size** is byte-identical to it and is
-  deleted at the source rather than moved — regardless of its filename.
-- The canonical root keeps a persistent hash cache at
-  `CANONICAL_ROOT/.hash_map.tsv` so repeat runs don't re-hash unchanged files.
+See the [README](README.md) for the user-facing description, CLI, and output
+layout. In short: `unify.py` folds multiple directory trees into the **first**
+(canonical) root, deduplicating by content hash — unique files are moved in
+preserving their relative paths, duplicates are archived under
+`TIMESTAMP/Duplicates/<hash>/`, and the canonical root keeps a persistent
+`.hash_map.tsv` cache.
 
 This program **moves and deletes real files**. That fact dominates every design
 decision below.
-
-## Provenance
-
-This is a Python port of an earlier macOS bash script (`unify.sh`,
-"dedupe_movies_unified.sh"). Behavioral parity with that script was a deliberate
-goal of the port, with several intentional changes (see "Intentional deviations"
-below). The port has since also gained correctness/safety fixes that go beyond
-the shell (cross-device moves, content-based dedup, an overlapping-roots guard).
-If you find a discrepancy with the shell script's behavior, assume it's
-intentional unless it looks like a bug — check the "Intentional deviations"
-section before "fixing" it.
 
 ## Architecture (and why it's shaped this way)
 
@@ -43,15 +23,15 @@ without a process boundary:
 
 - `main(argv=None) -> int` — **thin** CLI wrapper. Parses args, resolves/validates
   them, delegates, maps outcomes to an exit code. No business logic lives here.
-- `resolve_config(args) -> Config` — all validation; raises `SystemExit` with
-  the shell script's exact error wording on fatal, run-wide problems.
+- `resolve_config(args) -> Config` — all validation; raises `SystemExit` with a
+  clear error message on fatal, run-wide problems.
 - `unify(config) -> int` — the real entry point. Importable, no arg parsing of
   its own. Returns a **failure count** (0 == clean) so callers/tests can assert
   on it without catching `SystemExit`.
 - `index_canonical(run, old_cache)` — pass 1 over the canonical tree.
 - `merge_other_root(run, src_root)` — pass 2, called once per other root.
 - `archive_duplicate(...)` — the shared "move/delete a duplicate" logic both
-  passes call (this was duplicated ~40 lines in the original; keep it unified).
+  passes call (keep it unified — both passes must behave identically here).
 - `Config` — resolved, validated inputs (derived paths exposed as properties).
 - `Run` — live run state: the in-progress `Cache`, a `failures` counter, the
   `archived` map (`hash -> (path of first archived copy, size)`, which drives
@@ -114,15 +94,14 @@ bug even if tests pass.
 
 ## Error-handling model
 
-This was a specific design decision (matching the shell, with a twist):
+This is a deliberate design decision:
 
 - A failure on a **single file** (unreadable, failed `mkdir`/`mv`/`rm`, failed
   `stat`) is reported via `Run.warn`, which prints a `WARNING:` to stderr,
   increments `Run.failures`, and **continues** to the next file.
-- `stat_signature` returns `(-1, -1)` instead of raising, mirroring the shell's
-  `get_size_mtime` fallback. A file whose stat fails (size `< 0`) is warned-and-
-  skipped by both passes, so the `-1` sentinel never flows into size comparisons
-  or the cache.
+- `stat_signature` returns `(-1, -1)` instead of raising. A file whose stat fails
+  (size `< 0`) is warned-and-skipped by both passes, so the `-1` sentinel never
+  flows into size comparisons or the cache.
 - At the end, if `failures > 0`, the process exits **non-zero** even though it
   ran to completion. So "warn and continue" does not mean "pretend it succeeded."
 - **Fatal, run-wide** problems (canonical root isn't a directory, timestamp
@@ -130,31 +109,27 @@ This was a specific design decision (matching the shell, with a twist):
   overlapping the canonical root) raise `SystemExit` from `resolve_config` and
   stop everything before any mutation.
 
-Exit codes: `0` clean, `1` completed-with-failures or a fatal `OSError`, `2`
-argparse usage error (Python convention), `130` on `KeyboardInterrupt`.
+The exit-code table is in the README; the mapping itself lives in `main()`.
 
 When you add a new filesystem operation, wrap it the same way: catch `OSError`,
 call `run.warn(...)`, and `continue`. Don't let a single bad file kill a
 long-running consolidation of a large library.
 
-## Intentional deviations from the shell precursor
+## Deliberate design choices — don't undo these
 
-Don't "fix" these — they're chosen:
+Each of these is intentional; don't "simplify" it back:
 
-- **Timestamp precision is seconds** (`%Y%m%d%H%M%S`), where the shell used
-  minutes. The `-d`/`--dest` help text says `YYYYMMDDHHMMSS` to match.
-- **Pass 2 dedup lookup is in-memory** (`Run.cache.by_hash`) rather than
-  re-`grep`/`awk`-ing the cache file per file as the shell did. Uniques moved
-  earlier in the same pass are reflected because they're added to the in-memory
-  cache immediately. Equivalent result, far faster.
+- **Timestamp precision is seconds** (`%Y%m%d%H%M%S`). The `-d`/`--dest` help text
+  says `YYYYMMDDHHMMSS` to match.
+- **Pass 2 dedup lookup is in-memory** (`Run.cache.by_hash`), not re-read from the
+  cache file per file. Uniques moved earlier in the same pass are reflected
+  because they're added to the in-memory cache immediately.
 - **The cache is written, not appended.** `Cache.write` rewrites `.hash_map.tsv`
-  atomically after pass 1 and again after pass 2. The shell (and an earlier
-  version of this port) appended each pass-2 move to the file individually; that
-  per-file I/O is gone, and so is the partial-line-on-crash window it created.
+  atomically after pass 1 and again after pass 2 — no per-file append, and no
+  partial-line-on-crash window.
 - **The move log is held open for the whole run** (one line-buffered handle on
   `Run`) instead of reopening it per logged operation.
-- **argparse exit codes** (0 for `-h`, 2 for bad flags) follow Python convention
-  rather than the shell's `1`.
+- **argparse exit codes** (0 for `-h`, 2 for bad flags) follow Python convention.
 
 ## Conventions
 
@@ -162,8 +137,8 @@ Don't "fix" these — they're chosen:
   this is meant to be a drop-in script. Don't add a dependency without flagging
   the tradeoff explicitly; `argparse` over `click`, `hashlib` over anything, etc.
 - Type hints throughout; keep them.
-- The module docstring mirrors the shell script's header comment block. If
-  behavior changes, update the docstring and this file too.
+- Keep the module docstring in sync with actual behavior; if behavior changes,
+  update the docstring, the README, and this file too.
 - Filenames/dirs and tunables are module constants near the top
   (`CACHE_FILENAME`, `DUPLICATES_DIRNAME`, `LOG_FILENAME`, `SKIP_NAMES`,
   `CHUNK_SIZE`, `HASH_ALGOS`). Add new ones there, not as inline literals.
@@ -171,31 +146,25 @@ Don't "fix" these — they're chosen:
   `.hash_map.tsv`) so the cache isn't itself indexed/hashed/moved. It's a set, so
   it's cheap to extend.
 
-## How to run / sanity-check changes
+## How to sanity-check changes
 
 ```bash
-# Always compiles cleanly:
+# Must always compile cleanly:
 python3 -m py_compile unify.py
-
-# The safe smoke test — dry run shows intended actions, mutates nothing:
-python3 unify.py -n CANONICAL_ROOT OTHER_ROOT_1 OTHER_ROOT_2
-
-# Real run:
-python3 unify.py CANONICAL_ROOT OTHER_ROOT_1 OTHER_ROOT_2
 ```
 
-A good manual test fixture (this exercises every branch) is:
+See the README for how to run it. There is **no automated test suite yet** (see
+below); until there is, smoke-test with `-n`, then a real run, against a fixture
+that exercises every branch:
+
 - a canonical tree with a nested unique file **and** a second file with identical
-  content (intra-canonical dup),
-- an other root containing one file that duplicates canonical content and one
-  with brand-new content.
+  content (intra-canonical dup);
+- an other root with one file that duplicates canonical content and one with
+  brand-new content.
 
-Expected: the intra-canonical dup and the cross-root dup land under
-`TIMESTAMP/Duplicates/<hash>/`, the new file moves into the canonical tree, and
-`.hash_map.tsv` + `move_log.tsv` are written. Re-running should be a near-no-op
-(cache hits, nothing new to move).
-
-There is **no automated test suite yet** — see below.
+Expected: both dups land under `TIMESTAMP/Duplicates/<hash>/`, the new file moves
+into the canonical tree, and `.hash_map.tsv` + `move_log.tsv` are written. A
+second run should be a near-no-op (cache hits).
 
 ## Open threads / good next steps
 
@@ -214,9 +183,7 @@ These came up during development and are worth picking up:
    embarrassingly parallel and is the real bottleneck on large (multi-TB)
    libraries. The intended shape: parallelize *only* the hashing pass with a
    process pool (`concurrent.futures`), keep all move/cache/log bookkeeping
-   serial so the order-dependent invariants above hold. This is the main reason
-   the tool stays in Python rather than moving to Node — see the note in the repo
-   discussion / commit history.
+   serial so the order-dependent invariants above hold.
 3. **Configurable skip patterns.** `SKIP_NAMES` is hardcoded; a `--skip`/ignore
    mechanism (globs, or reading a `.unifyignore`) would be a natural extension.
 4. **Symlink / hardlink policy.** Currently unspecified — `os.walk` follows the
