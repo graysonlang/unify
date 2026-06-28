@@ -12,56 +12,6 @@ dependencies to install.
 > ⚠️ **This program moves and deletes real files.** Always do a dry run (`-n`)
 > first and read what it intends to do.
 
-## Requirements
-
-- Python 3.8+
-- Standard library only — no third-party dependencies.
-
-## Install
-
-There's nothing to install; it's a single script.
-
-```bash
-git clone <this-repo>
-cd unify
-python3 unify.py --help
-```
-
-Optionally make it executable and put it on your `PATH`:
-
-```bash
-chmod +x unify.py
-```
-
-## Usage
-
-```
-unify.py [options] CANONICAL_ROOT [OTHER_ROOT ...]
-```
-
-- `CANONICAL_ROOT` — the unified, canonical tree. It is both the source of truth
-  and the destination: unique content from the other roots is *moved into* it.
-- `OTHER_ROOT ...` — additional roots to fold in. Must be disjoint from the
-  canonical root (not the same as, inside, or containing it).
-
-### Options
-
-| Option | Description |
-| --- | --- |
-| `-n`, `--dry-run` | Show what would happen; move/delete/create nothing. |
-| `-d DIR`, `--dest DIR` | Name of the timestamp/metadata folder (default: `YYYYMMDDHHMMSS`). |
-| `-a ALGO`, `--algo ALGO` | Hash algorithm: `md5` (default) or `sha1`. |
-
-### Example
-
-```bash
-# Preview first — this mutates nothing:
-python3 unify.py -n MoviesUnified /Volumes/Backup1 /Volumes/Backup2
-
-# Then do it for real:
-python3 unify.py MoviesUnified /Volumes/Backup1 /Volumes/Backup2
-```
-
 ## What it does
 
 For each file it computes a content hash and decides:
@@ -143,6 +93,56 @@ CANONICAL_ROOT/.hash_map.tsv             # hash <TAB> relpath <TAB> size <TAB> m
 ```
 
 On later runs, a canonical file is re-hashed only if its size or mtime changed.
+
+## Requirements
+
+- Python 3.8+
+- Standard library only — no third-party dependencies.
+
+## Install
+
+There's nothing to install; it's a single script.
+
+```bash
+git clone <this-repo>
+cd unify
+python3 unify.py --help
+```
+
+Optionally make it executable and put it on your `PATH`:
+
+```bash
+chmod +x unify.py
+```
+
+## Usage
+
+```
+unify.py [options] CANONICAL_ROOT [OTHER_ROOT ...]
+```
+
+- `CANONICAL_ROOT` — the unified, canonical tree. It is both the source of truth
+  and the destination: unique content from the other roots is *moved into* it.
+- `OTHER_ROOT ...` — additional roots to fold in. Must be disjoint from the
+  canonical root (not the same as, inside, or containing it).
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| `-n`, `--dry-run` | Show what would happen; move/delete/create nothing. |
+| `-d DIR`, `--dest DIR` | Name of the timestamp/metadata folder (default: `YYYYMMDDHHMMSS`). |
+| `-a ALGO`, `--algo ALGO` | Hash algorithm: `md5` (default) or `sha1`. |
+
+### Example
+
+```bash
+# Preview first — this mutates nothing:
+python3 unify.py -n MoviesUnified /Volumes/Backup1 /Volumes/Backup2
+
+# Then do it for real:
+python3 unify.py MoviesUnified /Volumes/Backup1 /Volumes/Backup2
+```
 
 ## Safety notes
 
