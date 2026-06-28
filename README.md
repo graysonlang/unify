@@ -78,6 +78,53 @@ Deduplication is by content, so identical files with different names are still
 collapsed. Files are moved with `shutil.move`, so source and destination can live
 on different drives/filesystems.
 
+## What makes it different
+
+Most "find duplicate files" tools either just *report* dupes, or flatten
+everything into one bucket and leave you to sort out the mess. `unify` is built
+to produce a tree you'd actually want to keep, and it's conservative about your
+data:
+
+- **Your canonical tree is left intact.** The first root is the source of truth:
+  its unique files are never moved or renamed. Only true *intra-canonical*
+  duplicates (a file whose content already exists elsewhere in the same tree) are
+  pulled out. Everything you've already organized stays exactly where it is.
+
+- **Hierarchy is preserved when folding in other roots.** A new file from another
+  root keeps its relative path: `Backup1/Action/Heat.mkv` lands at
+  `Canonical/Action/Heat.mkv`, creating intermediate directories as needed
+  (`canonical_rel_for` + `os.makedirs`). It doesn't dump everything into one flat
+  folder — the structure you built on the other drives carries over.
+
+- **Original names are preserved; suffixes are a last resort.** A file keeps its
+  filename unless that exact path is already taken by *different* content. Only
+  then is a minimal disambiguating suffix added — `Heat_3f9a1c2b.mkv`, using the
+  content hash (and `_1`, `_2`, … if even that collides) — so two genuinely
+  different files with the same name can coexist without either clobbering the
+  other. Identical content never produces a suffixed copy; it's deduplicated.
+
+- **Content-addressed, so renames don't fool it.** Matching is by file hash, not
+  name or size, so `The Matrix (1999).mkv` and `matrix.mkv` with identical bytes
+  are recognized as the same file and collapsed. Conversely, two files that
+  happen to share a name but differ in content are both kept.
+
+- **Conservative by default — it archives, it doesn't destroy.** Duplicates are
+  *moved aside* into `TIMESTAMP/Duplicates/<hash>/`, grouped by content hash and
+  keeping their original filenames, rather than deleted. A source is only ever
+  deleted once a byte-identical copy (same hash *and* size) has been verified as
+  already archived in this run — so there's always a surviving copy. Combined
+  with `-n` (dry run) and the `move_log.tsv` record of every move, nothing
+  disappears without a trace.
+
+- **Incremental on re-runs.** The canonical tree carries a persistent hash cache
+  (`.hash_map.tsv`), so a second run re-hashes a file only if its size or mtime
+  changed — adding one more backup drive doesn't mean re-reading terabytes you've
+  already processed.
+
+- **Works across drives.** Moves use `shutil.move`, so the canonical tree and the
+  roots being folded in can live on entirely different volumes — the common case
+  when you're merging external backup disks.
+
 ## What it writes
 
 A timestamp folder is created in the current working directory:
